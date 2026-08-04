@@ -1,336 +1,208 @@
-import asyncio
-import logging
 import os
 import random
-from urllib.parse import quote
-import aiosqlite
+import string
+import logging
+from contextlib import asynccontextmanager
 
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart, CommandObject
+import aiosqlite
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-    CallbackQuery,
-)
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# Токен бота из переменной окружения Render или вставить вручную
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН_ЗДЕСЬ")
+# --- КОНФИГУРАЦИЯ ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Render автоматически выдает RENDER_EXTERNAL_URL (например, https://my-bot.onrender.com)
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+WEBHOOK_PATH = "/webhook"
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.getenv("PORT", 8080))
 
 logging.basicConfig(level=logging.INFO)
-
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher()
+router = Router()
 
-DB_NAME = "anon_bot.db"
+# --- БАЗА ДАННЫХ ---
+DB_NAME = "anon_chat.db"
 
-# --- Рандомайзер анонимных имен ---
-ADJECTIVES = ["Везучий", "Солнечный", "Мудрый", "Быстрый", "Загадочный", "Хитрый", "Ночной", "Яркий", "Смелый", "Лесной", "Огненный"]
-NOUNS = ["Волк", "Луч", "Кот", "Феникс", "Странник", "Лев", "Орел", "Дракон", "Енот", "Лис", "Тигр", "Сокол"]
-
-def generate_random_nickname() -> str:
-    return f"{random.choice(ADJECTIVES)} {random.choice(NOUNS)}"
-
-# --- FSM Состояния ---
-class AnonState(StatesGroup):
-    waiting_for_message = State()
-
-# --- Работа с Базой Данных ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS nicknames (
-                owner_id INTEGER,
-                partner_id INTEGER,
-                nickname TEXT,
-                PRIMARY KEY (owner_id, partner_id)
+        # Таблица пользователей и их ссылок
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                link_hash TEXT UNIQUE
             )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
+        ''')
+        # Таблица диалогов (закрепляет уникальный ник за связкой отправитель-получатель)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS dialogs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 sender_id INTEGER,
-                recipient_id INTEGER,
-                text TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                target_id INTEGER,
+                nickname TEXT,
+                UNIQUE(sender_id, target_id)
             )
-        """)
+        ''')
         await db.commit()
 
-async def get_or_create_nickname(owner_id: int, partner_id: int) -> str:
-    """Получает или создает имя для partner_id в глазах owner_id"""
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT nickname FROM nicknames WHERE owner_id = ? AND partner_id = ?",
-            (owner_id, partner_id)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return row[0]
+# --- ГЕНЕРАТОР НИКОВ ---
+ADJECTIVES = ["Тайный", "Скрытный", "Одинокий", "Дерзкий", "Веселый", "Мрачный", "Хитрый", "Милый"]
+NOUNS = ["Енот", "Волк", "Кот", "Ворон", "Лис", "Призрак", "Барсук", "Сокол"]
 
-        new_nick = generate_random_nickname()
-        await db.execute(
-            "INSERT INTO nicknames (owner_id, partner_id, nickname) VALUES (?, ?, ?)",
-            (owner_id, partner_id, new_nick)
-        )
-        await db.commit()
-        return new_nick
+def generate_nickname():
+    return f"{random.choice(ADJECTIVES)} {random.choice(NOUNS)} {random.randint(10, 99)}"
 
-async def save_message(sender_id: int, recipient_id: int, text: str):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT INTO messages (sender_id, recipient_id, text) VALUES (?, ?, ?)",
-            (sender_id, recipient_id, text)
-        )
-        await db.commit()
+# --- СОСТОЯНИЯ (FSM) ---
+class ChatStates(StatesGroup):
+    writing_message = State()
 
-async def get_interlocutors(user_id: int):
-    """Список всех ID пользователей, с кем есть переписка"""
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("""
-            SELECT DISTINCT 
-                CASE WHEN sender_id = ? THEN recipient_id ELSE sender_id END as partner_id
-            FROM messages
-            WHERE sender_id = ? OR recipient_id = ?
-        """, (user_id, user_id, user_id)) as cursor:
-            rows = await cursor.fetchall()
-            return [row[0] for row in rows]
+# --- ХЭНДЛЕРЫ ---
 
-async def get_chat_history(user_id: int, partner_id: int, limit: int = 5):
-    """Последние 5 сообщений диалога между двумя юзерами"""
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("""
-            SELECT sender_id, text, created_at
-            FROM messages
-            WHERE (sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)
-            ORDER BY id DESC
-            LIMIT ?
-        """, (user_id, partner_id, partner_id, user_id, limit)) as cursor:
-            rows = await cursor.fetchall()
-            return list(reversed(rows))
-
-# --- Главная функция отправки "Чистого" сообщения (Delete + Send) ---
-async def send_fresh(chat_id: int, text: str, reply_markup=None, old_message: Message = None):
-    if old_message:
-        try:
-            await old_message.delete()
-        except Exception:
-            pass
-    return await bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="HTML")
-
-# --- Главное меню ---
-async def show_main_menu(user_id: int, old_message: Message = None):
-    bot_info = await bot.get_me()
-    ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
-    
-    # Исправленный формат ссылки для sharing
-    share_text = quote("Отправь мне анонимное сообщение!")
-    share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={share_text}"
-
-    text = (
-        f"Вот твоя личная ссылка:\n\n"
-        f"👉 <code>{ref_link}</code>\n\n"
-        f"Опубликуй её и получай анонимные сообщения!"
-    )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Поделиться ссылкой", url=share_url)],
-        [InlineKeyboardButton(text="👥 Список собеседников", callback_data="list_chats")]
-    ])
-
-    await send_fresh(chat_id=user_id, text=text, reply_markup=kb, old_message=old_message)
-
-# --- Хэндлеры ---
-
-@dp.message(CommandStart())
-async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
-    # Удаляем входящую команду /start
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
+@router.message(CommandStart())
+async def cmd_start(message: Message, command: CommandStart, state: FSMContext):
     await state.clear()
     args = command.args
 
-    # Если перешли по реферальной ссылке (/start TARGET_ID)
-    if args and args.isdigit():
-        target_id = int(args)
-        if target_id == message.from_user.id:
-            await show_main_menu(message.from_user.id)
+    async with aiosqlite.connect(DB_NAME) as db:
+        if not args:
+            # Создаем или получаем ссылку пользователя
+            async with db.execute("SELECT link_hash FROM users WHERE user_id = ?", (message.from_user.id,)) as cursor:
+                row = await cursor.fetchone()
+            
+            if row:
+                link_hash = row[0]
+            else:
+                link_hash = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+                await db.execute("INSERT INTO users (user_id, link_hash) VALUES (?, ?)", (message.from_user.id, link_hash))
+                await db.commit()
+            
+            bot_info = await bot.get_me()
+            link = f"https://t.me/{bot_info.username}?start={link_hash}"
+            await message.answer(
+                f"🎭 <b>Твоя анонимная ссылка:</b>\n\n<code>{link}</code>\n\n"
+                f"Размести её в профиле или сторис. Все сообщения придут сюда!",
+                parse_mode="HTML"
+            )
             return
 
-        await state.update_data(target_id=target_id)
-        await state.set_state(AnonState.waiting_for_message)
+        # Если перешли по чужой ссылке
+        async with db.execute("SELECT user_id FROM users WHERE link_hash = ?", (args,)) as cursor:
+            row = await cursor.fetchone()
+        
+        if not row:
+            await message.answer("❌ Ссылка недействительна.")
+            return
+        
+        target_id = row[0]
+        if target_id == message.from_user.id:
+            await message.answer("😅 Нельзя писать анонимку самому себе!")
+            return
 
-        target_nick = await get_or_create_nickname(message.from_user.id, target_id)
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu")]
-        ])
-        await send_fresh(
-            chat_id=message.from_user.id,
-            text=f"🔒 Напиши анонимное сообщение для <b>{target_nick}</b>:",
-            reply_markup=kb
-        )
+        # Находим или создаем диалог (чтобы выдать постоянный ник)
+        async with db.execute("SELECT id, nickname FROM dialogs WHERE sender_id = ? AND target_id = ?", 
+                              (message.from_user.id, target_id)) as cursor:
+            dialog = await cursor.fetchone()
+        
+        if not dialog:
+            nickname = generate_nickname()
+            await db.execute("INSERT INTO dialogs (sender_id, target_id, nickname) VALUES (?, ?, ?)", 
+                             (message.from_user.id, target_id, nickname))
+            await db.commit()
+            async with db.execute("SELECT id FROM dialogs WHERE sender_id = ? AND target_id = ?", 
+                                  (message.from_user.id, target_id)) as cursor:
+                dialog_id = (await cursor.fetchone())[0]
+        else:
+            dialog_id = dialog[0]
+
+        # Сохраняем id диалога в стейт
+        await state.update_data(dialog_id=dialog_id)
+        await state.set_state(ChatStates.writing_message)
+        await message.answer("✍️ <b>Режим диалога включен.</b>\nНапиши свое сообщение (текст, фото или кружок), и я доставлю его анонимно!", parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("reply_"))
+async def callback_reply(callback: CallbackQuery, state: FSMContext):
+    dialog_id = int(callback.data.split("_")[1])
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT sender_id, target_id, nickname FROM dialogs WHERE id = ?", (dialog_id,)) as cursor:
+            dialog = await cursor.fetchone()
+            
+    if not dialog:
+        await callback.answer("Диалог не найден.", show_alert=True)
         return
-
-    # Обычный старт
-    await show_main_menu(message.from_user.id)
-
-@dp.callback_query(F.data == "main_menu")
-async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await show_main_menu(callback.from_user.id, old_message=callback.message)
-    await callback.answer()
-
-@dp.callback_query(F.data == "list_chats")
-async def cb_list_chats(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    partners = await get_interlocutors(callback.from_user.id)
-
-    if not partners:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")]
-        ])
-        await send_fresh(
-            chat_id=callback.from_user.id,
-            text="📭 <b>Список собеседников пуст.</b>\nПока никто не написал вам сообщения.",
-            reply_markup=kb,
-            old_message=callback.message
-        )
-    else:
-        buttons = []
-        for p_id in partners:
-            nick = await get_or_create_nickname(callback.from_user.id, p_id)
-            buttons.append([InlineKeyboardButton(text=f"👤 {nick}", callback_data=f"chat_{p_id}")])
         
-        buttons.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")])
-        
-        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await send_fresh(
-            chat_id=callback.from_user.id,
-            text="👥 <b>Ваши собеседники:</b>\nВыберите пользователя для просмотра переписки или ответа:",
-            reply_markup=kb,
-            old_message=callback.message
-        )
+    sender_id, target_id, nickname = dialog
+    
+    # Определяем, кто нажал на кнопку (владелец ссылки или аноним)
+    is_owner = (callback.from_user.id == target_id)
+    recipient_name = f"анониму <b>{nickname}</b>" if is_owner else "владельцу ссылки"
+
+    await state.update_data(dialog_id=dialog_id)
+    await state.set_state(ChatStates.writing_message)
+    await callback.message.answer(f"✍️ Напиши ответ {recipient_name}:", parse_mode="HTML")
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("chat_"))
-async def cb_open_chat(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    partner_id = int(callback.data.split("_")[1])
-    partner_nick = await get_or_create_nickname(callback.from_user.id, partner_id)
-    history = await get_chat_history(callback.from_user.id, partner_id, limit=5)
-
-    text = f"💬 <b>Диалог с: {partner_nick}</b>\n\n"
-    if not history:
-        text += "<i>Сообщений пока нет. Напишите первым!</i>\n"
-    else:
-        text += "<b>Последние 5 сообщений:</b>\n"
-        for sender_id, msg_text, _ in history:
-            if sender_id == callback.from_user.id:
-                text += f"🟢 <b>Вы:</b> {msg_text}\n"
-            else:
-                text += f"⚪️ <b>{partner_nick}:</b> {msg_text}\n"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✍️ Написать сообщение", callback_data=f"write_{partner_id}")],
-        [InlineKeyboardButton(text="🔄 Обновить диалог", callback_data=f"chat_{partner_id}")],
-        [InlineKeyboardButton(text="🔙 К списку собеседников", callback_data="list_chats")]
-    ])
-
-    await send_fresh(
-        chat_id=callback.from_user.id,
-        text=text,
-        reply_markup=kb,
-        old_message=callback.message
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("write_"))
-async def cb_write_start(callback: CallbackQuery, state: FSMContext):
-    partner_id = int(callback.data.split("_")[1])
-    partner_nick = await get_or_create_nickname(callback.from_user.id, partner_id)
-
-    await state.update_data(target_id=partner_id)
-    await state.set_state(AnonState.waiting_for_message)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"chat_{partner_id}")]
-    ])
-
-    await send_fresh(
-        chat_id=callback.from_user.id,
-        text=f"✍️ Напишите анонимное сообщение для <b>{partner_nick}</b>:",
-        reply_markup=kb,
-        old_message=callback.message
-    )
-    await callback.answer()
-
-@dp.message(AnonState.waiting_for_message)
-async def process_send_message(message: Message, state: FSMContext):
+@router.message(StateFilter(ChatStates.writing_message))
+async def process_message(message: Message, state: FSMContext):
     data = await state.get_data()
-    target_id = data.get("target_id")
-
-    # Удаляем написанный пользователем текст для сохранения чистоты и анонимности
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    if not target_id:
-        await show_main_menu(message.from_user.id)
+    dialog_id = data.get("dialog_id")
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT sender_id, target_id, nickname FROM dialogs WHERE id = ?", (dialog_id,)) as cursor:
+            dialog = await cursor.fetchone()
+            
+    if not dialog:
+        await message.answer("Ошибка: диалог закрыт.")
         await state.clear()
         return
+        
+    sender_id, target_id, nickname = dialog
+    is_owner = (message.from_user.id == target_id)
+    recipient_id = sender_id if is_owner else target_id
+    
+    # Формируем кнопку для ответа
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="↩️ Ответить", callback_data=f"reply_{dialog_id}")
+    ]])
 
-    # Сохраняем сообщение в БД
-    await save_message(sender_id=message.from_user.id, recipient_id=target_id, text=message.text)
+    header_text = f"📩 Ответик от владельца:" if is_owner else f"🎭 Новое сообщение от <b>{nickname}</b>:"
 
-    # Имена для обеих сторон
-    sender_nick_for_target = await get_or_create_nickname(target_id, message.from_user.id)
-    target_nick_for_sender = await get_or_create_nickname(message.from_user.id, target_id)
-
-    # Уведомляем получателя
     try:
-        kb_target = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💬 Открыть диалог", callback_data=f"chat_{message.from_user.id}")]
-        ])
-        await bot.send_message(
-            chat_id=target_id,
-            text=f"📩 <b>Новое анонимное сообщение от {sender_nick_for_target}!</b>\n\n«{message.text}»",
-            reply_markup=kb_target,
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass # Пользователь заблокировал бота
+        # Отправляем шапку, затем копируем само сообщение пользователя (сохраняет медиа, стикеры, форматирование)
+        await bot.send_message(chat_id=recipient_id, text=header_text, parse_mode="HTML")
+        await message.send_copy(chat_id=recipient_id, reply_markup=markup)
+        
+        await message.react([{"type": "emoji", "emoji": "👍"}]) # Ставим реакцию об успехе
+    except Exception as e:
+        logging.error(f"Failed to send message: {e}")
+        await message.answer("❌ Не удалось доставить сообщение. Возможно, пользователь заблокировал бота.")
 
-    await state.clear()
+# --- ЗАПУСК WEBHOOK (ДЛЯ RENDER) ---
+dp.include_router(router)
 
-    # Показываем обновленный диалог отправителю
-    history = await get_chat_history(message.from_user.id, target_id, limit=5)
-    text = f"✅ <b>Сообщение отправлено!</b>\n\n💬 <b>Диалог с: {target_nick_for_sender}</b>\n\n"
-    text += "<b>Последние 5 сообщений:</b>\n"
-    for sender_id, msg_text, _ in history:
-        if sender_id == message.from_user.id:
-            text += f"🟢 <b>Вы:</b> {msg_text}\n"
-        else:
-            text += f"⚪️ <b>{target_nick_for_sender}:</b> {msg_text}\n"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✍️ Написать еще", callback_data=f"write_{target_id}")],
-        [InlineKeyboardButton(text="🔙 К списку собеседников", callback_data="list_chats")]
-    ])
-
-    await send_fresh(chat_id=message.from_user.id, text=text, reply_markup=kb)
-
-# --- Запуск ---
-async def main():
+async def on_startup(bot: Bot):
     await init_db()
-    print("Бот успешно запущен!")
-    await dp.start_polling(bot)
+    if WEBHOOK_URL:
+        # Ставим вебхук только если есть URL (на Render)
+        await bot.set_webhook(f"{WEBHOOK_URL}{WEBHOOK_PATH}")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+def main():
+    dp.startup.register(on_startup)
+    app = web.Application()
+    
+    webhook_requests_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot
+    )
+    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+    
+    web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+
+if __name__ == '__main__':
+    main()
